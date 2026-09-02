@@ -1,5 +1,9 @@
+import sys
 import traceback
 from datetime import datetime
+from collections import deque
+from threading import Lock
+
 from arduino_iot_cloud import ArduinoCloudClient
 
 DEVICE_ID = "YOUR_DEVICE_ID"
@@ -20,17 +24,63 @@ y_received = False
 z_received = False
 
 
+# Maximum number of complete accelerometer samples kept in memory.
+# When the buffer becomes full, deque automatically removes
+# the oldest sample before adding the newest one.
+BUFFER_SIZE = 100
+
+# Each item is stored as:
+# (timestamp, x, y, z)
+live_buffer = deque(maxlen=BUFFER_SIZE)
+
+# Pprevents operations from changing/reading the buffer at exactly the same time.
+buffer_lock = Lock()
+
+
+def add_to_live_buffer(timestamp, x, y, z):
+    """
+    Add one synchronized accelerometer sample to the live buffer.
+
+    Parameters:
+        timestamp (str): Time when the complete XYZ sample is created.
+        x (float): Accelerometer X value.
+        y (float): Accelerometer Y value.
+        z (float): Accelerometer Z value.
+    """
+    with buffer_lock:
+        live_buffer.append((timestamp, x, y, z))
+
+
+def get_buffer_snapshot():
+    """
+    Return a safe copy of the current live buffer.
+
+    This function will be useful in Stage 3 when Plotly Dash
+    needs to read the latest sensor samples.
+    """
+    with buffer_lock:
+        return list(live_buffer)
+
+
 def save_data_if_ready():
     """
-    Save data only when new X, Y and Z values
+    Save and buffer data only when new X, Y and Z values
     have all been received.
     """
     global x_received, y_received, z_received
 
     if x_received and y_received and z_received:
 
-        # Create one timestamp for the complete set
+        # Create one timestamp for the complete XYZ set
         timestamp = datetime.now().isoformat(timespec="seconds")
+
+        # Add complete XYZ sample to rolling buffer
+        add_to_live_buffer(
+            timestamp,
+            latest_x,
+            latest_y,
+            latest_z
+        )
 
         # Create CSV line:
         # <timestamp>,<x>,<y>,<z>
@@ -40,13 +90,18 @@ def save_data_if_ready():
             data_file.write(csv_line)
             data_file.flush()
 
+        # Show current buffer size for testing
+        with buffer_lock:
+            current_buffer_size = len(live_buffer)
+
         print(
             f"Saved: {timestamp}, "
-            f"X={latest_x}, Y={latest_y}, Z={latest_z}"
+            f"X={latest_x}, Y={latest_y}, Z={latest_z} "
+            f"| Buffer: {current_buffer_size}/{BUFFER_SIZE}"
         )
 
-        # Reset flags
-        # Wait for another complete X, Y and Z set
+        # Reset flags.
+        # Wait for another complete X, Y and Z set.
         x_received = False
         y_received = False
         z_received = False
@@ -54,7 +109,6 @@ def save_data_if_ready():
 
 def on_accelerometer_x_changed(client, value):
     """Run when a new Accelerometer_X value is received."""
-
     global latest_x, x_received
 
     latest_x = value
@@ -67,7 +121,6 @@ def on_accelerometer_x_changed(client, value):
 
 def on_accelerometer_y_changed(client, value):
     """Run when a new Accelerometer_Y value is received."""
-
     global latest_y, y_received
 
     latest_y = value
@@ -80,7 +133,6 @@ def on_accelerometer_y_changed(client, value):
 
 def on_accelerometer_z_changed(client, value):
     """Run when a new Accelerometer_Z value is received."""
-
     global latest_z, z_received
 
     latest_z = value
@@ -92,21 +144,25 @@ def on_accelerometer_z_changed(client, value):
 
 
 def main():
-
     global data_file
 
     print("main() function")
+    print(f"Live buffer size: {BUFFER_SIZE} samples")
 
     # Open one CSV file in append mode
     data_file = open(DATA_FILENAME, mode="a", newline="")
 
-    # Write header
-    data_file.write("timestamp,x,y,z\n")
-    data_file.flush()
+    # Write header only when the file is empty
+    if data_file.tell() == 0:
+        data_file.write("timestamp,x,y,z\n")
+        data_file.flush()
 
     # Instantiate Arduino Cloud client
     client = ArduinoCloudClient(
-        device_id=DEVICE_ID, username=DEVICE_ID, password=SECRET_KEY)
+        device_id=DEVICE_ID,
+        username=DEVICE_ID,
+        password=SECRET_KEY
+    )
 
     # Register Accelerometer X
     client.register(
@@ -134,7 +190,6 @@ def main():
         client.start()
 
     finally:
-
         # Close CSV file when program stops
         if data_file is not None:
             data_file.flush()
@@ -146,7 +201,11 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()  # main function which runs in an internal infinite loop
-    except:
+        main()
+    except Exception:
         exc_type, exc_value, exc_traceback = sys.exc_info()
-        traceback.print_tb(exc_type, file=print)
+        traceback.print_exception(
+            exc_type,
+            exc_value,
+            exc_traceback
+        )

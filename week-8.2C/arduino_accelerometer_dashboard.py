@@ -1,13 +1,52 @@
 import sys
+import json
 import traceback
+from pathlib import Path
 from datetime import datetime
 from collections import deque
 from threading import Lock
 
 from arduino_iot_cloud import ArduinoCloudClient
 
-DEVICE_ID = "YOUR_DEVICE_ID"
-SECRET_KEY = "YOUR_SECRET_KEY"
+# ============================================================
+# Load Arduino IoT Cloud credentials from settings.json
+# ============================================================
+
+SETTINGS_FILE = Path(__file__).with_name("settings.json")
+
+
+def load_settings():
+    """
+    Load Arduino IoT Cloud credentials from settings.json.
+
+    Expected format:
+    {
+        "device_id": "...",
+        "secret_key": "..."
+    }
+    """
+    if not SETTINGS_FILE.exists():
+        raise FileNotFoundError(
+            f"Settings file not found: {SETTINGS_FILE}\n"
+            "Create settings.json in the same folder as this script."
+        )
+
+    with SETTINGS_FILE.open("r", encoding="utf-8") as file:
+        settings = json.load(file)
+
+    device_id = settings.get("device_id")
+    secret_key = settings.get("secret_key")
+
+    if not device_id or not secret_key:
+        raise ValueError(
+            "settings.json must contain both "
+            "'device_id' and 'secret_key'."
+        )
+
+    return device_id, secret_key
+
+
+DEVICE_ID, SECRET_KEY = load_settings()
 
 # Store all three variables in one CSV file
 DATA_FILENAME = "accelerometer_xyz.csv"
@@ -23,7 +62,6 @@ x_received = False
 y_received = False
 z_received = False
 
-
 # Maximum number of complete accelerometer samples kept in memory.
 # When the buffer becomes full, deque automatically removes
 # the oldest sample before adding the newest one.
@@ -33,7 +71,7 @@ BUFFER_SIZE = 100
 # (timestamp, x, y, z)
 live_buffer = deque(maxlen=BUFFER_SIZE)
 
-# Pprevents operations from changing/reading the buffer at exactly the same time.
+# Prevents operations from changing/reading the buffer at exactly the same time.
 buffer_lock = Lock()
 
 

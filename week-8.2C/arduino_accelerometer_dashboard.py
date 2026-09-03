@@ -136,7 +136,6 @@ def create_smooth_live_graph(
         yaxis_title=y_axis_title
     )
 
-    # Dash callback is created inside the wrapper.
     @app.callback(
         Output(graph_id, "extendData"),
         Input(interval_id, "n_intervals")

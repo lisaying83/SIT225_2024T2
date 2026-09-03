@@ -30,7 +30,7 @@ SECRET_KEY = settings["secret_key"]
 DATA_FILENAME = "accelerometer_xyz.csv"
 
 BUFFER_SIZE = 100
-UPDATE_INTERVAL = 250  # milliseconds
+UPDATE_INTERVAL = 1000  # milliseconds
 
 data_file = None
 
@@ -52,22 +52,17 @@ z_received = False
 # Shared live data buffer
 # ------------------------------------------------------------
 
-# Each sample has this format:
+# Each item has this format:
 # (timestamp, value1, value2, ...)
-#
-# For the accelerometer:
-# (timestamp, x, y, z)
+# For example: (timestamp, x, y, z)
 
 data_buffer = deque(maxlen=BUFFER_SIZE)
 buffer_lock = Lock()
 
 
-def add_sample_to_buffer(timestamp, *values):
+def add_data_to_buffer(timestamp, *values):
     """
-    Add one complete sensor sample to the shared buffer.
-
-    Example:
-        add_sample_to_buffer(timestamp, x, y, z)
+    Add one complete sensor data item to the shared buffer.
     """
     with buffer_lock:
         data_buffer.append((timestamp, *values))
@@ -76,7 +71,7 @@ def add_sample_to_buffer(timestamp, *values):
 
 
 # ------------------------------------------------------------
-# Stage 5 wrapper function
+# The wrapper 
 # ------------------------------------------------------------
 
 def create_smooth_live_graph(
@@ -86,55 +81,36 @@ def create_smooth_live_graph(
     variable_names,
     graph_id="live-sensor-graph",
     buffer_size=100,
-    update_interval=250,
+    update_interval=000,
     title="Live Sensor Data",
     y_axis_title="Value"
 ):
     """
     Create a smooth real-time Plotly Dash graph for continuous data.
 
-    The function:
-    1. creates the Plotly graph
-    2. creates the Dash timer
-    3. reads fresh data from the buffer
-    4. appends only new points using extendData
-    5. keeps only the latest buffer_size points on the graph
-
-    Expected buffer sample format:
+    Expected buffer item format:
         (timestamp, value1, value2, ...)
-
-    Example for accelerometer:
-        (timestamp, x, y, z)
 
     Parameters:
         app:
             Dash application.
-
         data_buffer:
-            Shared deque containing new sensor samples.
-
+            Shared deque containing new sensor data.
         buffer_lock:
             Lock used to protect the shared buffer.
-
         variable_names:
             Names of the sensor variables.
             Example: ["X", "Y", "Z"]
-
         graph_id:
             ID used by the Dash graph.
-
         buffer_size:
             Maximum number of visible points.
-
         update_interval:
             How often Dash checks for new data, in milliseconds.
-
         title:
             Graph title.
-
         y_axis_title:
             Label for the y-axis.
-
     Returns:
         A Dash html.Div containing the graph and timer.
     """
@@ -167,7 +143,7 @@ def create_smooth_live_graph(
     )
     def update_graph(n_intervals):
 
-        # Copy all fresh samples, then clear the waiting buffer.
+        # Copy all fresh items, then clear the waiting buffer.
         with buffer_lock:
             new_data = list(data_buffer)
             data_buffer.clear()
@@ -231,14 +207,14 @@ def save_data_if_ready():
 
         timestamp = datetime.now().isoformat(timespec="seconds")
 
-        buffer_size = add_sample_to_buffer(
+        buffer_size = add_data_to_buffer(
             timestamp,
             latest_x,
             latest_y,
             latest_z
         )
 
-        # Save the same complete sample to CSV.
+        # Save the same complete data item to CSV.
         csv_line = (
             f"{timestamp},"
             f"{latest_x},"

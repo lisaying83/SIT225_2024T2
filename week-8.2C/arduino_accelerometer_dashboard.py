@@ -28,6 +28,7 @@ SECRET_KEY = settings["secret_key"]
 # ------------------------------------------------------------
 
 DATA_FILENAME = "accelerometer_xyz.csv"
+
 BUFFER_SIZE = 100
 UPDATE_INTERVAL = 250  # milliseconds
 
@@ -48,39 +49,176 @@ z_received = False
 
 
 # ------------------------------------------------------------
-# Live data buffer
+# Shared live data buffer
 # ------------------------------------------------------------
 
-# This buffer stores new samples waiting to be sent to Dash.
-data_buffer = deque(maxlen=BUFFER_SIZE)
+# Each sample has this format:
+# (timestamp, value1, value2, ...)
+#
+# For the accelerometer:
+# (timestamp, x, y, z)
 
-# Arduino writes to the buffer while Dash reads it.
+data_buffer = deque(maxlen=BUFFER_SIZE)
 buffer_lock = Lock()
 
 
-def add_to_buffer(timestamp, x, y, z):
-    """Add one complete XYZ sample to the buffer."""
-    with buffer_lock:
-        data_buffer.append((timestamp, x, y, z))
-        return len(data_buffer)
-
-
-def get_new_data():
+def add_sample_to_buffer(timestamp, *values):
     """
-    Get all new samples currently waiting in the buffer.
+    Add one complete sensor sample to the shared buffer.
 
-    After Dash reads them, clear the buffer because these samples
-    have already been sent to the graph.
+    Example:
+        add_sample_to_buffer(timestamp, x, y, z)
     """
     with buffer_lock:
-        new_data = list(data_buffer)
-        data_buffer.clear()
+        data_buffer.append((timestamp, *values))
 
-    return new_data
+    return len(data_buffer)
 
 
 # ------------------------------------------------------------
-# Synchronise X, Y and Z
+# Stage 5 wrapper function
+# ------------------------------------------------------------
+
+def create_smooth_live_graph(
+    app,
+    data_buffer,
+    buffer_lock,
+    variable_names,
+    graph_id="live-sensor-graph",
+    buffer_size=100,
+    update_interval=250,
+    title="Live Sensor Data",
+    y_axis_title="Value"
+):
+    """
+    Create a smooth real-time Plotly Dash graph for continuous data.
+
+    The function:
+    1. creates the Plotly graph
+    2. creates the Dash timer
+    3. reads fresh data from the buffer
+    4. appends only new points using extendData
+    5. keeps only the latest buffer_size points on the graph
+
+    Expected buffer sample format:
+        (timestamp, value1, value2, ...)
+
+    Example for accelerometer:
+        (timestamp, x, y, z)
+
+    Parameters:
+        app:
+            Dash application.
+
+        data_buffer:
+            Shared deque containing new sensor samples.
+
+        buffer_lock:
+            Lock used to protect the shared buffer.
+
+        variable_names:
+            Names of the sensor variables.
+            Example: ["X", "Y", "Z"]
+
+        graph_id:
+            ID used by the Dash graph.
+
+        buffer_size:
+            Maximum number of visible points.
+
+        update_interval:
+            How often Dash checks for new data, in milliseconds.
+
+        title:
+            Graph title.
+
+        y_axis_title:
+            Label for the y-axis.
+
+    Returns:
+        A Dash html.Div containing the graph and timer.
+    """
+
+    interval_id = f"{graph_id}-interval"
+
+    # Create the graph only once.
+    figure = go.Figure()
+
+    for variable in variable_names:
+        figure.add_trace(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="lines",
+                name=variable
+            )
+        )
+
+    figure.update_layout(
+        title=title,
+        xaxis_title="Time",
+        yaxis_title=y_axis_title
+    )
+
+    # Dash callback is created inside the wrapper.
+    @app.callback(
+        Output(graph_id, "extendData"),
+        Input(interval_id, "n_intervals")
+    )
+    def update_graph(n_intervals):
+
+        # Copy all fresh samples, then clear the waiting buffer.
+        with buffer_lock:
+            new_data = list(data_buffer)
+            data_buffer.clear()
+
+        if not new_data:
+            raise PreventUpdate
+
+        timestamps = [sample[0] for sample in new_data]
+
+        # Build one list of values for each sensor variable.
+        values = []
+
+        for index in range(len(variable_names)):
+            variable_values = [
+                sample[index + 1]
+                for sample in new_data
+            ]
+            values.append(variable_values)
+
+        update_data = {
+            "x": [
+                timestamps
+                for variable in variable_names
+            ],
+            "y": values
+        }
+
+        trace_indices = list(range(len(variable_names)))
+
+        # extendData adds only new points.
+        # buffer_size keeps the visible graph window limited.
+        return update_data, trace_indices, buffer_size
+
+    return html.Div(
+        [
+            dcc.Graph(
+                id=graph_id,
+                figure=figure
+            ),
+
+            dcc.Interval(
+                id=interval_id,
+                interval=update_interval,
+                n_intervals=0
+            )
+        ]
+    )
+
+
+# ------------------------------------------------------------
+# Synchronise accelerometer X, Y and Z
 # ------------------------------------------------------------
 
 def save_data_if_ready():
@@ -93,16 +231,20 @@ def save_data_if_ready():
 
         timestamp = datetime.now().isoformat(timespec="seconds")
 
-        # Add the complete sample to the live buffer.
-        buffer_size = add_to_buffer(
+        buffer_size = add_sample_to_buffer(
             timestamp,
             latest_x,
             latest_y,
             latest_z
         )
 
-        # Also save the sample to CSV.
-        csv_line = f"{timestamp},{latest_x},{latest_y},{latest_z}\n"
+        # Save the same complete sample to CSV.
+        csv_line = (
+            f"{timestamp},"
+            f"{latest_x},"
+            f"{latest_y},"
+            f"{latest_z}\n"
+        )
 
         if data_file is not None:
             data_file.write(csv_line)
@@ -110,11 +252,13 @@ def save_data_if_ready():
 
         print(
             f"Saved: {timestamp}, "
-            f"X={latest_x}, Y={latest_y}, Z={latest_z} "
+            f"X={latest_x}, "
+            f"Y={latest_y}, "
+            f"Z={latest_z} "
             f"| Waiting in buffer: {buffer_size}"
         )
 
-        # Wait for a new complete XYZ set.
+        # Wait for another complete XYZ set.
         x_received = False
         y_received = False
         z_received = False
@@ -125,6 +269,7 @@ def on_accelerometer_x_changed(client, value):
 
     latest_x = value
     x_received = True
+
     save_data_if_ready()
 
 
@@ -133,6 +278,7 @@ def on_accelerometer_y_changed(client, value):
 
     latest_y = value
     y_received = True
+
     save_data_if_ready()
 
 
@@ -141,89 +287,8 @@ def on_accelerometer_z_changed(client, value):
 
     latest_z = value
     z_received = True
+
     save_data_if_ready()
-
-
-# ------------------------------------------------------------
-# Plotly Dash
-# ------------------------------------------------------------
-
-def create_initial_figure():
-    """Create the three empty X, Y and Z lines once."""
-    figure = go.Figure()
-
-    for axis in ["X", "Y", "Z"]:
-        figure.add_trace(
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="lines",
-                name=axis
-            )
-        )
-
-    figure.update_layout(
-        title="Live Accelerometer Data",
-        xaxis_title="Time",
-        yaxis_title="Acceleration"
-    )
-
-    return figure
-
-
-app = Dash(__name__)
-
-app.layout = html.Div(
-    [
-        html.H2("Live Smartphone Accelerometer"),
-
-        dcc.Graph(
-            id="live-accelerometer-graph",
-            figure=create_initial_figure()
-        ),
-
-        dcc.Interval(
-            id="graph-update-interval",
-            interval=UPDATE_INTERVAL,
-            n_intervals=0
-        )
-    ]
-)
-
-
-@app.callback(
-    Output("live-accelerometer-graph", "extendData"),
-    Input("graph-update-interval", "n_intervals")
-)
-def update_graph(n_intervals):
-    """
-    Send only new samples to the existing Plotly graph.
-    """
-    new_data = get_new_data()
-
-    if not new_data:
-        raise PreventUpdate
-
-    timestamps = [sample[0] for sample in new_data]
-    x_values = [sample[1] for sample in new_data]
-    y_values = [sample[2] for sample in new_data]
-    z_values = [sample[3] for sample in new_data]
-
-    update_data = {
-        "x": [
-            timestamps,
-            timestamps,
-            timestamps
-        ],
-        "y": [
-            x_values,
-            y_values,
-            z_values
-        ]
-    }
-
-    # Trace 0 = X, Trace 1 = Y, Trace 2 = Z
-    return update_data, [0, 1, 2], BUFFER_SIZE
 
 
 # ------------------------------------------------------------
@@ -231,6 +296,7 @@ def update_graph(n_intervals):
 # ------------------------------------------------------------
 
 def run_arduino_cloud():
+
     client = ArduinoCloudClient(
         device_id=DEVICE_ID,
         username=DEVICE_ID,
@@ -256,7 +322,33 @@ def run_arduino_cloud():
     )
 
     print("Starting Arduino IoT Cloud...")
+
     client.start()
+
+
+# ------------------------------------------------------------
+# Dash application
+# ------------------------------------------------------------
+
+app = Dash(__name__)
+
+app.layout = html.Div(
+    [
+        html.H2("Live Smartphone Accelerometer"),
+
+        create_smooth_live_graph(
+            app=app,
+            data_buffer=data_buffer,
+            buffer_lock=buffer_lock,
+            variable_names=["X", "Y", "Z"],
+            graph_id="accelerometer-graph",
+            buffer_size=BUFFER_SIZE,
+            update_interval=UPDATE_INTERVAL,
+            title="Live Accelerometer Data",
+            y_axis_title="Acceleration"
+        )
+    ]
+)
 
 
 # ------------------------------------------------------------
@@ -266,18 +358,25 @@ def run_arduino_cloud():
 def main():
     global data_file
 
-    data_file = open(DATA_FILENAME, "a", newline="")
+    data_file = open(
+        DATA_FILENAME,
+        "a",
+        newline=""
+    )
 
     # Write CSV header only if the file is empty.
     if data_file.tell() == 0:
-        data_file.write("timestamp,x,y,z\n")
+        data_file.write(
+            "timestamp,x,y,z\n"
+        )
         data_file.flush()
 
-    # Run Arduino IoT Cloud in the background.
+    # Arduino IoT Cloud runs in the background.
     cloud_thread = Thread(
         target=run_arduino_cloud,
         daemon=True
     )
+
     cloud_thread.start()
 
     try:
@@ -299,5 +398,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+
     except KeyboardInterrupt:
         print("Program stopped.")

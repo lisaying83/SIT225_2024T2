@@ -8,6 +8,7 @@ from threading import Lock, Thread
 
 from arduino_iot_cloud import ArduinoCloudClient
 from dash import Dash, dcc, html, Input, Output
+from dash.exceptions import PreventUpdate
 import plotly.graph_objects as go
 
 # ============================================================
@@ -89,19 +90,33 @@ def add_to_live_buffer(timestamp, x, y, z):
         y (float): Accelerometer Y value.
         z (float): Accelerometer Z value.
     """
+    global total_samples_received
+
     with buffer_lock:
         live_buffer.append((timestamp, x, y, z))
+        total_samples_received += 1
+
+
+# Total number of complete XYZ samples received since startup.
+# This keeps increasing even after the rolling buffer reaches its limit.
+total_samples_received = 0
 
 
 def get_buffer_snapshot():
     """
     Return a safe copy of the current live buffer.
-
-    This function will be useful in Stage 3 when Plotly Dash
-    needs to read the latest sensor samples.
     """
     with buffer_lock:
         return list(live_buffer)
+
+
+def get_buffer_state():
+    """
+    Return a safe copy of the rolling buffer together with the
+    total number of synchronized samples received.
+    """
+    with buffer_lock:
+        return list(live_buffer), total_samples_received
 
 
 def save_data_if_ready():
@@ -184,82 +199,31 @@ def on_accelerometer_z_changed(client, value):
     save_data_if_ready()
 
 
-app = Dash(__name__)
+# Number of samples already sent to the browser.
+last_graph_sample_count = 0
 
-app.layout = html.Div(
-    [
-        html.H2("Live Smartphone Accelerometer"),
-
-        html.P(
-            f"Showing the latest {BUFFER_SIZE} synchronized X, Y and Z samples."
-        ),
-
-        dcc.Graph(
-            id="live-accelerometer-graph",
-            figure=go.Figure()
-        ),
-
-        # Ask Dash to check the rolling buffer regularly.
-        # Stage 3 uses 250 ms. Stage 4 can improve how the
-        # graph itself is updated.
-        dcc.Interval(
-            id="graph-update-interval",
-            interval=250,       # milliseconds
-            n_intervals=0
-        )
-    ]
-)
+# Protect the graph sample counter in case callbacks overlap.
+graph_count_lock = Lock()
 
 
-@app.callback(
-    Output("live-accelerometer-graph", "figure"),
-    Input("graph-update-interval", "n_intervals")
-)
-def update_accelerometer_graph(n_intervals):
+def create_initial_figure():
     """
-    Read a snapshot of the rolling buffer and update the Dash graph.
+    Create the Plotly figure once.
 
-    Arduino IoT Cloud writes data to live_buffer.
-    Dash only reads a copy returned by get_buffer_snapshot().
-    This keeps data collection separate from visualisation.
+    New sensor values are added later with extendData, so the full
+    figure does not need to be recreated on every timer interval.
     """
-
-    data = get_buffer_snapshot()
-
     figure = go.Figure()
 
-    if data:
-        timestamps = [sample[0] for sample in data]
-        x_values = [sample[1] for sample in data]
-        y_values = [sample[2] for sample in data]
-        z_values = [sample[3] for sample in data]
-
-        figure.add_trace(
-            go.Scatter(
-                x=timestamps,
-                y=x_values,
-                mode="lines",
-                name="X"
-            )
-        )
-
-        figure.add_trace(
-            go.Scatter(
-                x=timestamps,
-                y=y_values,
-                mode="lines",
-                name="Y"
-            )
-        )
-
-        figure.add_trace(
-            go.Scatter(
-                x=timestamps,
-                y=z_values,
-                mode="lines",
-                name="Z"
-            )
-        )
+    figure.add_trace(
+        go.Scatter(x=[], y=[], mode="lines", name="X")
+    )
+    figure.add_trace(
+        go.Scatter(x=[], y=[], mode="lines", name="Y")
+    )
+    figure.add_trace(
+        go.Scatter(x=[], y=[], mode="lines", name="Z")
+    )
 
     figure.update_layout(
         title="Live Accelerometer Data",
@@ -269,6 +233,88 @@ def update_accelerometer_graph(n_intervals):
     )
 
     return figure
+
+
+app = Dash(__name__)
+
+app.layout = html.Div(
+    [
+        html.H2("Live Smartphone Accelerometer"),
+
+        html.P(
+            f"Smooth live view of the latest {BUFFER_SIZE} "
+            "synchronized X, Y and Z samples."
+        ),
+
+        dcc.Graph(
+            id="live-accelerometer-graph",
+            figure=create_initial_figure()
+        ),
+
+        dcc.Interval(
+            id="graph-update-interval",
+            interval=250,
+            n_intervals=0
+        )
+    ]
+)
+
+
+@app.callback(
+    Output("live-accelerometer-graph", "extendData"),
+    Input("graph-update-interval", "n_intervals")
+)
+def extend_accelerometer_graph(n_intervals):
+    """
+    Append only fresh samples to the existing Plotly traces.
+
+    dcc.Graph.extendData expects:
+        update_data, trace_indices, max_points
+
+    BUFFER_SIZE is used as max_points, so Plotly removes old points
+    automatically after the visible window reaches the buffer size.
+    """
+    global last_graph_sample_count
+
+    data, total_count = get_buffer_state()
+
+    if not data:
+        raise PreventUpdate
+
+    with graph_count_lock:
+        new_sample_count = total_count - last_graph_sample_count
+
+        if new_sample_count <= 0:
+            raise PreventUpdate
+
+        # If the graph was delayed and more data arrived than is still
+        # stored in the rolling buffer, send only the available points.
+        new_sample_count = min(new_sample_count, len(data))
+        new_samples = data[-new_sample_count:]
+
+        last_graph_sample_count = total_count
+
+    timestamps = [sample[0] for sample in new_samples]
+    x_values = [sample[1] for sample in new_samples]
+    y_values = [sample[2] for sample in new_samples]
+    z_values = [sample[3] for sample in new_samples]
+
+    update_data = {
+        "x": [
+            timestamps,
+            timestamps,
+            timestamps
+        ],
+        "y": [
+            x_values,
+            y_values,
+            z_values
+        ]
+    }
+
+    trace_indices = [0, 1, 2]
+
+    return update_data, trace_indices, BUFFER_SIZE
 
 
 def run_arduino_cloud():
@@ -311,7 +357,8 @@ def main():
 
     print("main() function")
     print(f"Live buffer size: {BUFFER_SIZE} samples")
-    print("Dash refresh interval: 250 ms")
+    print("Dash check interval: 250 ms")
+    print("Graph update mode: incremental extendData")
 
     # Open CSV file once for the complete program execution.
     data_file = open(DATA_FILENAME, mode="a", newline="")

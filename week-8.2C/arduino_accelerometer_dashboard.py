@@ -81,7 +81,7 @@ def create_smooth_live_graph(
     variable_names,
     graph_id="live-sensor-graph",
     buffer_size=100,
-    update_interval=000,
+    update_interval=1000,
     title="Live Sensor Data",
     y_axis_title="Value"
 ):

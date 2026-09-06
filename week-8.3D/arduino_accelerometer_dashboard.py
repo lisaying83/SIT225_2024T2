@@ -1,11 +1,13 @@
+import base64
 import json
 from pathlib import Path
 from datetime import datetime
 from collections import deque
 from threading import Lock, Thread
 
+import cv2
 from arduino_iot_cloud import ArduinoCloudClient
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, dcc, html, Input, Output, no_update
 from dash.exceptions import PreventUpdate
 import plotly.graph_objects as go
 
@@ -31,8 +33,10 @@ DATA_FILENAME = "accelerometer_xyz.csv"
 
 BUFFER_SIZE = 100
 UPDATE_INTERVAL = 1000  # milliseconds
+WEBCAM_INDEX = 0
 
 data_file = None
+webcam = None
 
 
 # ------------------------------------------------------------
@@ -71,7 +75,38 @@ def add_data_to_buffer(timestamp, *values):
 
 
 # ------------------------------------------------------------
-# The wrapper 
+# Webcam
+# ------------------------------------------------------------
+
+def capture_webcam_image():
+    """
+    Capture one image from the laptop webcam and convert it
+    to a format that Dash can display.
+    """
+    if webcam is None:
+        return None
+
+    success, frame = webcam.read()
+
+    if not success:
+        print("Could not capture webcam image.")
+        return None
+
+    success, encoded_image = cv2.imencode(".jpg", frame)
+
+    if not success:
+        print("Could not encode webcam image.")
+        return None
+
+    image_base64 = base64.b64encode(
+        encoded_image
+    ).decode("utf-8")
+
+    return f"data:image/jpeg;base64,{image_base64}"
+
+
+# ------------------------------------------------------------
+# Live graph and activity image
 # ------------------------------------------------------------
 
 def create_smooth_live_graph(
@@ -80,44 +115,22 @@ def create_smooth_live_graph(
     buffer_lock,
     variable_names,
     graph_id="live-sensor-graph",
+    image_id="activity-image",
     buffer_size=100,
-    update_interval=000,
+    update_interval=1000,
     title="Live Sensor Data",
     y_axis_title="Value"
 ):
     """
-    Create a smooth real-time Plotly Dash graph for continuous data.
+    Create a real-time Plotly Dash graph and show a webcam image
+    whenever fresh sensor data is used to update the graph.
 
     Expected buffer item format:
         (timestamp, value1, value2, ...)
-
-    Parameters:
-        app:
-            Dash application.
-        data_buffer:
-            Shared deque containing new sensor data.
-        buffer_lock:
-            Lock used to protect the shared buffer.
-        variable_names:
-            Names of the sensor variables.
-            Example: ["X", "Y", "Z"]
-        graph_id:
-            ID used by the Dash graph.
-        buffer_size:
-            Maximum number of visible points.
-        update_interval:
-            How often Dash checks for new data, in milliseconds.
-        title:
-            Graph title.
-        y_axis_title:
-            Label for the y-axis.
-    Returns:
-        A Dash html.Div containing the graph and timer.
     """
 
     interval_id = f"{graph_id}-interval"
 
-    # Create the graph only once.
     figure = go.Figure()
 
     for variable in variable_names:
@@ -138,19 +151,24 @@ def create_smooth_live_graph(
 
     @app.callback(
         Output(graph_id, "extendData"),
+        Output(image_id, "src"),
         Input(interval_id, "n_intervals")
     )
-    def update_graph(n_intervals):
+    def update_dashboard(n_intervals):
 
         # Copy all fresh items, then clear the waiting buffer.
         with buffer_lock:
             new_data = list(data_buffer)
             data_buffer.clear()
 
+        # Do nothing until fresh accelerometer data arrives.
         if not new_data:
             raise PreventUpdate
 
-        timestamps = [sample[0] for sample in new_data]
+        timestamps = [
+            sample[0]
+            for sample in new_data
+        ]
 
         # Build one list of values for each sensor variable.
         values = []
@@ -170,17 +188,63 @@ def create_smooth_live_graph(
             "y": values
         }
 
-        trace_indices = list(range(len(variable_names)))
+        trace_indices = list(
+            range(len(variable_names))
+        )
 
-        # extendData adds only new points.
-        # buffer_size keeps the visible graph window limited.
-        return update_data, trace_indices, buffer_size
+        # Capture one webcam image at the same time as
+        # this fresh graph update.
+        image_src = capture_webcam_image()
+
+        if image_src is None:
+            image_src = no_update
+
+        graph_update = (
+            update_data,
+            trace_indices,
+            buffer_size
+        )
+
+        return graph_update, image_src
 
     return html.Div(
         [
-            dcc.Graph(
-                id=graph_id,
-                figure=figure
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            dcc.Graph(
+                                id=graph_id,
+                                figure=figure
+                            )
+                        ],
+                        style={
+                            "width": "65%"
+                        }
+                    ),
+
+                    html.Div(
+                        [
+                            html.H4("Current Activity Image"),
+
+                            html.Img(
+                                id=image_id,
+                                style={
+                                    "width": "100%",
+                                    "maxWidth": "480px"
+                                }
+                            )
+                        ],
+                        style={
+                            "width": "35%",
+                            "padding": "20px"
+                        }
+                    )
+                ],
+                style={
+                    "display": "flex",
+                    "alignItems": "center"
+                }
             ),
 
             dcc.Interval(
@@ -204,7 +268,9 @@ def save_data_if_ready():
 
     if x_received and y_received and z_received:
 
-        timestamp = datetime.now().isoformat(timespec="seconds")
+        timestamp = datetime.now().isoformat(
+            timespec="seconds"
+        )
 
         buffer_size = add_data_to_buffer(
             timestamp,
@@ -213,7 +279,8 @@ def save_data_if_ready():
             latest_z
         )
 
-        # Save the same complete data item to CSV.
+        # Keep the Task 5C CSV logging for now.
+        # Stage 3 will change this to 10-second CSV files.
         csv_line = (
             f"{timestamp},"
             f"{latest_x},"
@@ -317,6 +384,7 @@ app.layout = html.Div(
             buffer_lock=buffer_lock,
             variable_names=["X", "Y", "Z"],
             graph_id="accelerometer-graph",
+            image_id="activity-image",
             buffer_size=BUFFER_SIZE,
             update_interval=UPDATE_INTERVAL,
             title="Live Accelerometer Data",
@@ -331,8 +399,9 @@ app.layout = html.Div(
 # ------------------------------------------------------------
 
 def main():
-    global data_file
+    global data_file, webcam
 
+    # Open the Task 5C CSV file.
     data_file = open(
         DATA_FILENAME,
         "a",
@@ -345,6 +414,21 @@ def main():
             "timestamp,x,y,z\n"
         )
         data_file.flush()
+
+    # Open the laptop webcam once and keep it available.
+    webcam = cv2.VideoCapture(
+        WEBCAM_INDEX
+    )
+
+    if not webcam.isOpened():
+        print(
+            "Warning: Could not open the webcam. "
+            "The graph can still run."
+        )
+        webcam.release()
+        webcam = None
+    else:
+        print("Webcam opened.")
 
     # Arduino IoT Cloud runs in the background.
     cloud_thread = Thread(
@@ -366,6 +450,9 @@ def main():
         )
 
     finally:
+        if webcam is not None:
+            webcam.release()
+
         if data_file is not None:
             data_file.close()
 

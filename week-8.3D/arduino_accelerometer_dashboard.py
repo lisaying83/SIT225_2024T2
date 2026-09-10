@@ -1,5 +1,7 @@
 import base64
+import csv
 import json
+import time
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -29,14 +31,15 @@ SECRET_KEY = settings["secret_key"]
 # Basic settings
 # ------------------------------------------------------------
 
-DATA_FILENAME = "accelerometer_xyz.csv"
-
+WINDOW_SECONDS = 10
 BUFFER_SIZE = 100
-UPDATE_INTERVAL = 1000  # milliseconds
+UPDATE_INTERVAL = 1000  # Dash checks once per second
 WEBCAM_INDEX = 0
 
-data_file = None
+OUTPUT_FOLDER = Path(__file__).with_name("activity_data")
+
 webcam = None
+sample_sequence = 1
 
 
 # ------------------------------------------------------------
@@ -53,25 +56,33 @@ z_received = False
 
 
 # ------------------------------------------------------------
-# Shared live data buffer
+# Shared 10-second data buffer
 # ------------------------------------------------------------
 
 # Each item has this format:
-# (timestamp, value1, value2, ...)
-# For example: (timestamp, x, y, z)
+# (timestamp, x, y, z)
 
-data_buffer = deque(maxlen=BUFFER_SIZE)
+data_buffer = deque()
 buffer_lock = Lock()
+
+# This starts when the first complete XYZ sample arrives.
+window_start_time = None
 
 
 def add_data_to_buffer(timestamp, *values):
     """
-    Add one complete sensor data item to the shared buffer.
+    Add one complete accelerometer sample to the current
+    10-second data window.
     """
+    global window_start_time
+
     with buffer_lock:
+        if window_start_time is None:
+            window_start_time = time.monotonic()
+
         data_buffer.append((timestamp, *values))
 
-    return len(data_buffer)
+        return len(data_buffer)
 
 
 # ------------------------------------------------------------
@@ -80,29 +91,110 @@ def add_data_to_buffer(timestamp, *values):
 
 def capture_webcam_image():
     """
-    Capture one image from the laptop webcam and convert it
-    to a format that Dash can display.
+    Capture one image from the laptop webcam.
+
+    Returns:
+        frame:
+            OpenCV image used for saving to JPG.
+        image_src:
+            Base64 image used for displaying in Dash.
     """
     if webcam is None:
-        return None
+        return None, None
 
     success, frame = webcam.read()
 
     if not success:
         print("Could not capture webcam image.")
-        return None
+        return None, None
 
     success, encoded_image = cv2.imencode(".jpg", frame)
 
     if not success:
         print("Could not encode webcam image.")
-        return None
+        return None, None
 
     image_base64 = base64.b64encode(
         encoded_image
     ).decode("utf-8")
 
-    return f"data:image/jpeg;base64,{image_base64}"
+    image_src = (
+        f"data:image/jpeg;base64,{image_base64}"
+    )
+
+    return frame, image_src
+
+
+# ------------------------------------------------------------
+# Save one 10-second activity sample
+# ------------------------------------------------------------
+
+def save_activity_sample(samples, frame):
+    """
+    Save one 10-second accelerometer data window and its
+    matching webcam image.
+
+    Example:
+        1_20260906224530.csv
+        1_20260906224530.jpg
+    """
+    global sample_sequence
+
+    OUTPUT_FOLDER.mkdir(exist_ok=True)
+
+    file_timestamp = datetime.now().strftime(
+        "%Y%m%d%H%M%S"
+    )
+
+    base_filename = (
+        f"{sample_sequence}_{file_timestamp}"
+    )
+
+    csv_path = OUTPUT_FOLDER / (
+        f"{base_filename}.csv"
+    )
+
+    image_path = OUTPUT_FOLDER / (
+        f"{base_filename}.jpg"
+    )
+
+    # Save the webcam image first.
+    image_saved = cv2.imwrite(
+        str(image_path),
+        frame
+    )
+
+    if not image_saved:
+        print("Could not save webcam image.")
+        return
+
+    try:
+        with csv_path.open(
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as file:
+            writer = csv.writer(file)
+
+            writer.writerow(
+                ["timestamp", "x", "y", "z"]
+            )
+
+            writer.writerows(samples)
+
+    except Exception:
+        # Do not leave an unmatched image if CSV saving fails.
+        image_path.unlink(missing_ok=True)
+        raise
+
+    print(
+        f"Saved activity sample: "
+        f"{base_filename}.csv + "
+        f"{base_filename}.jpg "
+        f"({len(samples)} readings)"
+    )
+
+    sample_sequence += 1
 
 
 # ------------------------------------------------------------
@@ -122,11 +214,16 @@ def create_smooth_live_graph(
     y_axis_title="Value"
 ):
     """
-    Create a real-time Plotly Dash graph and show a webcam image
-    whenever fresh sensor data is used to update the graph.
+    Update the dashboard after approximately 10 seconds of
+    fresh accelerometer data have been collected.
 
-    Expected buffer item format:
-        (timestamp, value1, value2, ...)
+    The same 10-second data window is:
+        1. added to the Plotly graph,
+        2. saved to a CSV file.
+
+    At the same time, one webcam image is:
+        1. displayed in the dashboard,
+        2. saved as a matching JPG file.
     """
 
     interval_id = f"{graph_id}-interval"
@@ -155,13 +252,23 @@ def create_smooth_live_graph(
         Input(interval_id, "n_intervals")
     )
     def update_dashboard(n_intervals):
+        global window_start_time
 
-        # Copy all fresh items, then clear the waiting buffer.
+        # Dash checks every second, but only processes data
+        # when a complete 10-second window is ready.
         with buffer_lock:
-            new_data = list(data_buffer)
-            data_buffer.clear()
+            if (
+                not data_buffer
+                or window_start_time is None
+                or time.monotonic() - window_start_time
+                < WINDOW_SECONDS
+            ):
+                new_data = None
+            else:
+                new_data = list(data_buffer)
+                data_buffer.clear()
+                window_start_time = None
 
-        # Do nothing until fresh accelerometer data arrives.
         if not new_data:
             raise PreventUpdate
 
@@ -170,7 +277,6 @@ def create_smooth_live_graph(
             for sample in new_data
         ]
 
-        # Build one list of values for each sensor variable.
         values = []
 
         for index in range(len(variable_names)):
@@ -178,6 +284,7 @@ def create_smooth_live_graph(
                 sample[index + 1]
                 for sample in new_data
             ]
+
             values.append(variable_values)
 
         update_data = {
@@ -192,12 +299,21 @@ def create_smooth_live_graph(
             range(len(variable_names))
         )
 
-        # Capture one webcam image at the same time as
-        # this fresh graph update.
-        image_src = capture_webcam_image()
+        # Capture one image for this 10-second window.
+        frame, image_src = capture_webcam_image()
 
-        if image_src is None:
+        if frame is not None:
+            save_activity_sample(
+                new_data,
+                frame
+            )
+        else:
             image_src = no_update
+            print(
+                "10-second data window received, "
+                "but no image was captured, so the "
+                "CSV/JPG pair was not saved."
+            )
 
         graph_update = (
             update_data,
@@ -262,14 +378,14 @@ def create_smooth_live_graph(
 
 def save_data_if_ready():
     """
-    Process data only after a new X, Y and Z value have all arrived.
+    Add data only after a new X, Y and Z value have all arrived.
     """
     global x_received, y_received, z_received
 
     if x_received and y_received and z_received:
 
         timestamp = datetime.now().isoformat(
-            timespec="seconds"
+            timespec="milliseconds"
         )
 
         buffer_size = add_data_to_buffer(
@@ -279,25 +395,13 @@ def save_data_if_ready():
             latest_z
         )
 
-        # Keep the Task 5C CSV logging for now.
-        # Stage 3 will change this to 10-second CSV files.
-        csv_line = (
-            f"{timestamp},"
-            f"{latest_x},"
-            f"{latest_y},"
-            f"{latest_z}\n"
-        )
-
-        if data_file is not None:
-            data_file.write(csv_line)
-            data_file.flush()
-
         print(
-            f"Saved: {timestamp}, "
+            f"Received: {timestamp}, "
             f"X={latest_x}, "
             f"Y={latest_y}, "
             f"Z={latest_z} "
-            f"| Waiting in buffer: {buffer_size}"
+            f"| Current window: "
+            f"{buffer_size} readings"
         )
 
         # Wait for another complete XYZ set.
@@ -308,7 +412,7 @@ def save_data_if_ready():
 
 def on_accelerometer_x_changed(client, value):
     global latest_x, x_received
-
+   
     latest_x = value
     x_received = True
 
@@ -317,7 +421,7 @@ def on_accelerometer_x_changed(client, value):
 
 def on_accelerometer_y_changed(client, value):
     global latest_y, y_received
-
+    
     latest_y = value
     y_received = True
 
@@ -399,21 +503,7 @@ app.layout = html.Div(
 # ------------------------------------------------------------
 
 def main():
-    global data_file, webcam
-
-    # Open the Task 5C CSV file.
-    data_file = open(
-        DATA_FILENAME,
-        "a",
-        newline=""
-    )
-
-    # Write CSV header only if the file is empty.
-    if data_file.tell() == 0:
-        data_file.write(
-            "timestamp,x,y,z\n"
-        )
-        data_file.flush()
+    global webcam
 
     # Open the laptop webcam once and keep it available.
     webcam = cv2.VideoCapture(
@@ -421,10 +511,8 @@ def main():
     )
 
     if not webcam.isOpened():
-        print(
-            "Warning: Could not open the webcam. "
-            "The graph can still run."
-        )
+        print("Warning: Could not open the webcam.")
+
         webcam.release()
         webcam = None
     else:
@@ -441,6 +529,7 @@ def main():
     try:
         print("Starting Plotly Dash...")
         print("Open http://127.0.0.1:8050")
+        print("A CSV/JPG pair will be saved every 10 seconds.")
 
         app.run(
             host="127.0.0.1",
@@ -452,9 +541,6 @@ def main():
     finally:
         if webcam is not None:
             webcam.release()
-
-        if data_file is not None:
-            data_file.close()
 
 
 if __name__ == "__main__":

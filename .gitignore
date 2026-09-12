@@ -218,3 +218,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 settings.json
+
+# Generated activity CSV copies and image files
+week-8.3D/activity_csv_files/
+*.jpg

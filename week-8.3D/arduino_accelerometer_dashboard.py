@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from datetime import datetime
 from collections import deque
-from threading import Lock, Thread
+from threading import Lock, Thread, Event
 
 import cv2
 from arduino_iot_cloud import ArduinoCloudClient
@@ -36,10 +36,16 @@ BUFFER_SIZE = 100
 UPDATE_INTERVAL = 1000  # Dash checks once per second
 WEBCAM_INDEX = 0
 
+# Arduino IoT Cloud low-latency settings.
+# The client is driven manually so MQTT messages are processed quickly.
+CLIENT_POLL = 0.01          # seconds between client.update() calls
+REGISTER_INTERVAL = 0.1     # cloud variable task interval
+
 OUTPUT_FOLDER = Path(__file__).with_name("activity_data")
 
 webcam = None
 sample_sequence = 1
+stop_event = Event()
 
 
 # ------------------------------------------------------------
@@ -55,8 +61,9 @@ y_received = False
 z_received = False
 
 
+
 # ------------------------------------------------------------
-# Shared 10-second data buffer
+# Shared 10-second activity-window buffer
 # ------------------------------------------------------------
 
 # Each item has this format:
@@ -412,7 +419,7 @@ def save_data_if_ready():
 
 def on_accelerometer_x_changed(client, value):
     global latest_x, x_received
-   
+
     latest_x = value
     x_received = True
 
@@ -421,7 +428,7 @@ def on_accelerometer_x_changed(client, value):
 
 def on_accelerometer_y_changed(client, value):
     global latest_y, y_received
-    
+
     latest_y = value
     y_received = True
 
@@ -442,34 +449,51 @@ def on_accelerometer_z_changed(client, value):
 # ------------------------------------------------------------
 
 def run_arduino_cloud():
+    """
+    Connect to Arduino IoT Cloud in synchronous mode and
+    manually process incoming MQTT messages.
+    """
 
     client = ArduinoCloudClient(
         device_id=DEVICE_ID,
         username=DEVICE_ID,
-        password=SECRET_KEY
+        password=SECRET_KEY,
+        sync_mode=True
     )
 
     client.register(
         "Accelerometer_X",
         value=None,
-        on_write=on_accelerometer_x_changed
+        on_write=on_accelerometer_x_changed,
+        interval=REGISTER_INTERVAL
     )
 
     client.register(
         "Accelerometer_Y",
         value=None,
-        on_write=on_accelerometer_y_changed
+        on_write=on_accelerometer_y_changed,
+        interval=REGISTER_INTERVAL
     )
 
     client.register(
         "Accelerometer_Z",
         value=None,
-        on_write=on_accelerometer_z_changed
+        on_write=on_accelerometer_z_changed,
+        interval=REGISTER_INTERVAL
     )
 
-    print("Starting Arduino IoT Cloud...")
+    print("Starting Arduino IoT Cloud in low-latency sync mode...")
 
+    # In sync mode, start() establishes the connection and returns.
     client.start()
+
+    # Process MQTT/cloud messages continuously instead of depending
+    # on the library's default asynchronous scheduling.
+    while not stop_event.is_set():
+        client.update()
+
+        if stop_event.wait(CLIENT_POLL):
+            break
 
 
 # ------------------------------------------------------------
@@ -539,6 +563,8 @@ def main():
         )
 
     finally:
+        stop_event.set()
+
         if webcam is not None:
             webcam.release()
 
@@ -548,4 +574,5 @@ if __name__ == "__main__":
         main()
 
     except KeyboardInterrupt:
+        stop_event.set()
         print("Program stopped.")
